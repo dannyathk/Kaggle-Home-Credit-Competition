@@ -1,0 +1,343 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Wed Jun 13 00:18:56 2018
+
+@author: chanh
+"""
+
+# Import Library
+import gc
+from tqdm import tqdm
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from functools import reduce
+import seaborn as sns
+from sklearn.preprocessing import OneHotEncoder, LabelEncoder
+
+# Display in full width
+pd.set_option('display.expand_frame_repr', False)
+pd.set_option('display.max_rows', 999)
+
+#Define path for input data and output model
+data_path = 'D:/Danny/Python3/Kaggle/Home Credit Group/home-credit-default-risk/'
+out_path = 'D:/Danny/Python3/Kaggle/Home Credit Group/'
+
+#Read Data
+train_set = pd.read_csv(data_path+'application_train.csv.zip', compression='zip')
+test_set = pd.read_csv(data_path+'application_test.csv.zip', compression='zip')
+
+bureau = pd.read_csv(data_path+'bureau.csv.zip', compression='zip')
+bureau_balance = pd.read_csv(data_path+'bureau_balance.csv.zip', compression='zip')
+credit_card_balance = pd.read_csv(data_path+'credit_card_balance.csv.zip', compression='zip')
+
+installment_payments = pd.read_csv(data_path+'installments_payments.csv.zip', compression='zip')
+pos_cash_balance = pd.read_csv(data_path+'pos_cash_balance.csv.zip', compression='zip')
+previous_application = pd.read_csv(data_path+'previous_application.csv.zip', compression='zip')
+
+# EDA
+def describe(data):
+    _result = []
+    for col in tqdm(data.columns):
+        NNA = data[col].isnull().sum()/ len(data[col])
+        if col in data.select_dtypes(include=[int, float, np.integer, np.int32, np.int64, np.float, np.float32, np.float64]).columns:
+            _hist = data[col].quantile([0.0,0.25,0.5,0.75,1.0]).tolist()
+            _result.append([col, data[col].dtype, '{:.2%}'.format(NNA), '[{:6.2f} {:6.2f} {:6.2f} {:6.2f} {:6.2f}]'.format(*_hist), '{:6.2f}'.format(data[col].mean())])
+        elif col in data.select_dtypes(include=[object]).columns:
+            _result.append([col, data[col].dtype, '{:.2%}'.format(NNA), np.round(data[col].value_counts(normalize=True)*100, 2).to_dict(), np.nan])
+        else:
+            print(col, data[col].dtype)
+    return pd.DataFrame(data=_result, columns=['var','type','NA','Dist.','Mean'])
+    del _hist, _result, col, NNA
+
+result = describe(train_set)
+gc.collect()
+
+
+# Create New Features
+# 1. Days Past Due status from Bureau Data for Previous Applications
+print ('Create Feature from DPD status from Bureau Data')
+dpd = []
+for i in [bureau_balance['MONTHS_BALANCE'].min(), -24, -12]:
+    merge_bureau = pd.merge(bureau[['SK_ID_CURR','SK_ID_BUREAU']], bureau_balance[bureau_balance['MONTHS_BALANCE']>i], on='SK_ID_BUREAU', how='right')
+    merge_bureau = merge_bureau.dropna(subset=['SK_ID_CURR'])
+    merge_bureau = merge_bureau[~merge_bureau['STATUS'].isin(['C','X','0'])]
+    merge_bureau = merge_bureau.groupby(['SK_ID_CURR','STATUS']).size().reset_index(drop=False)
+    merge_bureau.columns = ['SK_ID_CURR','STATUS','DPD_Freq']
+
+    for x in tqdm(['1','2','3','4','5']):
+        tmp = merge_bureau[merge_bureau['STATUS'].isin([x])]
+        tmp = tmp[['SK_ID_CURR', 'DPD_Freq']]
+        tmp.columns = ['SK_ID_CURR', 'P{}_STATUS_{}'.format(np.abs(i), x)]
+        dpd.append(tmp)
+    
+dpd = reduce(lambda x,y: pd.merge(x, y, how='outer', on='SK_ID_CURR'), dpd).fillna(0)
+dpd = dpd.apply(pd.to_numeric, downcast='float')
+del merge_bureau, tmp
+gc.collect()
+#print (describe(dpd))
+
+#dpd = pd.merge(train_set[['SK_ID_CURR','TARGET']], dpd, on='SK_ID_CURR', how='left')
+#for col in dpd.columns:
+#    plt.subplots(figsize=(12,9))
+#    dpd.groupby([col])['TARGET']
+#    plt.plot(np.unique(dpd[col].dropna()), dpd.groupby([col])['TARGET'].mean(), 'b-')
+#    plt.xlabel(col, color='black')
+#    plt.ylabel('Bad Rate', color='blue')
+#    plt.show()
+
+
+# 2. Previous credit from Home Credit
+print ('Create Feature from Previosu Credit from Home Credit')
+pos_cash_balance['SK_DPD_STATUS'] = pd.cut(pos_cash_balance['SK_DPD'], [-np.inf,0,30,60,90,120,np.inf], include_lowest=True,
+                labels=['Pass','X+DPD','30+DPD','60+DPD','90+DPD','120+DPD'])
+pos_cash_balance['SK_DPD_DEF_STATUS'] = pd.cut(pos_cash_balance['SK_DPD_DEF'], [-np.inf,0,30,60,90,120,np.inf], include_lowest=True,
+                labels=['Pass','X+DPD','30+DPD','60+DPD','90+DPD','120+DPD'])
+
+merge_pos_1 = pos_cash_balance.groupby(['SK_ID_CURR','SK_DPD_STATUS']).size().reset_index(drop=False)
+merge_pos_1.columns = ['SK_ID_CURR', 'SK_DPD_STATUS', 'DPD_Freq']
+merge_pos_2 = pos_cash_balance.groupby(['SK_ID_CURR','SK_DPD_DEF_STATUS']).size().reset_index(drop=False)
+merge_pos_2.columns = ['SK_ID_CURR', 'SK_DPD_DEF_STATUS', 'DPD_Freq']
+credit_hist = []
+dpd_buckets = ['Pass','X+DPD','30+DPD','60+DPD','90+DPD','120_+DPD']
+for i in tqdm(dpd_buckets):
+    tmp = pd.merge(merge_pos_1[merge_pos_1['SK_DPD_STATUS'].isin([i])], merge_pos_2[merge_pos_2['SK_DPD_DEF_STATUS'].isin([i])], how='outer', 
+                               on=['SK_ID_CURR'])
+    tmp.columns = ['SK_ID_CURR','SK_DPD_STATUS', 'Past_DPD_Status_%d' %dpd_buckets.index(i)
+                ,'SK_DPD_DEF_STATUS','Past_DPD_DEF_Status_%d' %dpd_buckets.index(i)]
+    tmp = tmp.drop(['SK_DPD_STATUS','SK_DPD_DEF_STATUS'], axis=1)
+    credit_hist.append(tmp)
+credit_hist = reduce(lambda x,y: pd.merge(x,y,how='outer', on=['SK_ID_CURR']), credit_hist)
+credit_hist = credit_hist.fillna(0)
+del merge_pos_1, merge_pos_2, dpd_buckets
+gc.collect()
+
+# 3. Instalment History Data
+print ('Create Feature from Instalment Data')
+installment_payments['Early_Payment'] = installment_payments['DAYS_INSTALMENT'] - installment_payments['DAYS_ENTRY_PAYMENT']
+installment_payments['Repayment_AMT'] = installment_payments['AMT_PAYMENT'] - installment_payments['AMT_INSTALMENT']
+instal_hist = installment_payments.groupby('SK_ID_CURR').agg({'Early_Payment':'mean','Repayment_AMT':'mean'}).reset_index()
+
+# 4. Application Data
+print ('Create Feature from Application data')
+train_target = train_set.TARGET
+train_set['table'] = 'train'
+test_set['table'] = 'test'
+incl_columns = ['SK_ID_CURR','NAME_CONTRACT_TYPE','CODE_GENDER','FLAG_OWN_REALTY','AMT_INCOME_TOTAL','AMT_ANNUITY', 'NAME_INCOME_TYPE','NAME_EDUCATION_TYPE','OCCUPATION_TYPE'
+                ,'REGION_RATING_CLIENT','REGION_RATING_CLIENT_W_CITY', 'EXT_SOURCE_1','EXT_SOURCE_2', 'EXT_SOURCE_3'
+                ,'OBS_30_CNT_SOCIAL_CIRCLE','DEF_30_CNT_SOCIAL_CIRCLE','OBS_60_CNT_SOCIAL_CIRCLE','DEF_60_CNT_SOCIAL_CIRCLE'
+                ,'AMT_REQ_CREDIT_BUREAU_QRT','AMT_REQ_CREDIT_BUREAU_YEAR'
+                ,'table']
+train_test_set = pd.concat([train_set[incl_columns], test_set[incl_columns]], axis=0)
+train_test_set['DEBT_INCOME_RATIO'] = train_test_set['AMT_ANNUITY']/ train_test_set['AMT_INCOME_TOTAL']
+#describe(train_test_set)
+train_test_set['OCCUPATION_TYPE']=train_test_set['OCCUPATION_TYPE'].fillna('Missing')
+train_test_set['EXT_SOURCE_1']=train_test_set['EXT_SOURCE_1'].fillna(-99)
+train_test_set['EXT_SOURCE_2']=train_test_set['EXT_SOURCE_2'].fillna(-99)
+train_test_set['EXT_SOURCE_3']=train_test_set['EXT_SOURCE_3'].fillna(-99)
+
+#missing_numerical_cols = [i for i in train_test_set.columns if (train_test_set[i].dtype!=np.object) & (train_test_set[i].isnull().any()==True)]
+#train_test_set[missing_numerical_cols] = train_test_set[missing_numerical_cols].fillna(0)
+
+cat_cols = [i for i in train_test_set[incl_columns] if train_test_set[i].dtype==np.object]
+cat_index = [train_test_set.columns.tolist().index(i) for i in cat_cols]
+oth_cols = [i for i in train_test_set[incl_columns] if i not in cat_cols]
+
+
+# 5. Previous Applications in Home Credit
+#print (describe(previous_application))
+print ('Create Feature from Previous Application')
+prev_status = []
+for i in [-730, -365]:
+    tmp = previous_application[previous_application['DAYS_DECISION']>i][['SK_ID_CURR','NAME_CONTRACT_STATUS']]
+    for status in np.unique(previous_application['NAME_CONTRACT_STATUS']):
+        tmp_1 = tmp[tmp['NAME_CONTRACT_STATUS'].isin([status])]
+        tmp_1 = tmp_1.groupby(['SK_ID_CURR'])['NAME_CONTRACT_STATUS'].size().reset_index(drop=False)
+        tmp_1.columns = ['SK_ID_CURR','P{}_{}'.format(np.abs(int(i/365)), status)]
+        prev_status.append(tmp_1)
+    del tmp_1, tmp
+    gc.collect()
+prev_status = reduce(lambda x,y: pd.merge(x,y,how='left', on='SK_ID_CURR'), prev_status)
+prev_status = prev_status.fillna(0)
+prev_status = prev_status.apply(pd.to_numeric, downcast='integer')
+prev_status = prev_status.apply(pd.to_numeric, downcast='float')
+#prev_status.info()
+#describe(prev_status)
+
+# 6. Credit Card Balance Data
+print ('Create Feature from Credit Card Balance data')
+tmp = credit_card_balance.groupby(['SK_ID_CURR','SK_ID_PREV','MONTHS_BALANCE'])['AMT_BALANCE','AMT_CREDIT_LIMIT_ACTUAL','SK_DPD','SK_DPD_DEF'].\
+    agg({'AMT_BALANCE':sum,'AMT_CREDIT_LIMIT_ACTUAL':sum,'SK_DPD':max,'SK_DPD_DEF':max}).reset_index(drop=False)
+tmp['U_rate'] = tmp['AMT_BALANCE']/ tmp['AMT_CREDIT_LIMIT_ACTUAL']
+tmp = tmp.groupby(['SK_ID_CURR','MONTHS_BALANCE']).agg({'U_rate':'mean','SK_DPD':max,'SK_DPD_DEF':max}).reset_index(drop=False)
+tmp.columns = ['SK_ID_CURR','MONTHS_BALANCE','U_rate','Card_DPD','Card_DPD_DEF']
+card = []
+for i in [-12,-6]:
+    tmp_1 = tmp[tmp['MONTHS_BALANCE']>=i]
+    tmp_1 = tmp_1.groupby('SK_ID_CURR').agg({'U_rate':'mean','Card_DPD':max,'Card_DPD_DEF':max}).reset_index(drop=False)
+    tmp_1.columns=['SK_ID_CURR', 'P{}_UR'.format(np.abs(i)),'P{}_Worst_DPD'.format(np.abs(i)),'P{}_Worst_DPD_DEF'.format(np.abs(i))]
+    print (tmp_1.head())
+    card.append(tmp_1)
+del tmp_1, tmp
+gc.collect()
+card = reduce(lambda x,y: pd.merge(x,y,on='SK_ID_CURR', how='outer'), card)
+
+
+# LabelEncoding for categorical columns in Application Data
+aggr_set = train_test_set[oth_cols]
+for ix in tqdm(cat_cols):
+    train_test_set[ix] = LabelEncoder().fit_transform(train_test_set[ix])
+    new_cols = ['%s_%d' %(ix, i) for i in np.arange(len(np.unique(train_test_set[ix])))+1]
+    Encoder = OneHotEncoder(categorical_features='all')
+    append_set = pd.DataFrame(data=Encoder.fit_transform(train_test_set[ix].values.reshape(-1,1)).toarray()
+                            , index=train_test_set.index,columns=new_cols)
+    aggr_set = pd.concat([aggr_set, append_set], axis=1)
+aggr_set = aggr_set.apply(pd.to_numeric, downcast='integer')
+gc.collect()
+aggr_set['train'] = aggr_set['table_2']
+aggr_set = aggr_set.drop(['table_1','table_2'],axis=1)
+
+
+# Merge all features dataset to create train-test dataset
+var_data_list = [aggr_set, dpd, credit_hist, instal_hist, prev_status, card]
+var_data = reduce(lambda x,y: pd.merge(x,y,how='left', on='SK_ID_CURR'), var_data_list)
+var_data = var_data.apply(pd.to_numeric, downcast='float')
+
+
+# Variable distribution
+def outliers_z_score(y, threshold):
+    mean_y = np.mean(y)
+    std_y = np.std(y)
+    z_scores = (y - mean_y)/std_y
+    return np.where(np.abs(z_scores) > threshold)
+
+def plot_dist(y):
+    fig, ax = plt.subplots(figsize=(12,8))
+    tmp_dist = y
+    outlier_idx = outliers_z_score(tmp_dist,3.0)[0]
+    outlier_dist = pd.Series([i for idx,i in enumerate(tmp_dist) if idx in outlier_idx ])
+    sns.distplot(tmp_dist, kde=False, bins=50, color='blue', label='Non-outlier')
+    sns.distplot(outlier_dist, kde=False, bins=50, color='red',label = 'Outlier')
+    plt.legend(loc='uppertop')
+    plt.show()
+
+plot_dist(np.log(var_data['AMT_INCOME_TOTAL']))
+plot_dist(var_data['EXT_SOURCE_1'])
+plot_dist([i for i in var_data['EXT_SOURCE_1'] if i != 0.0])
+plot_dist(var_data.loc[var_data['train']==1, 'EXT_SOURCE_2'])
+plot_dist(var_data.loc[var_data['train']==0, 'EXT_SOURCE_2'])
+
+for i in var_data.columns:
+    if var_data[i].dtype in [np.float, np.float16, np.float32, np.float64]:
+        print (i)
+        plot_dist(var_data[i])
+
+
+
+# Modeling 
+# 1. XGB Model
+import xgboost as xgb
+from itertools import product
+x_train =var_data[var_data['train']==1].drop('train', axis=1)
+y_train = train_target
+x_test = var_data[var_data['train']!=1].drop('train', axis=1)
+
+dtrain = xgb.DMatrix(x_train, label=y_train)
+dtest = xgb.DMatrix(x_test)
+         
+param_list = {
+        'max_depth':6 , 
+        'eta':0.1, 
+        'objective':'binary:logistic',
+        'subsample':0.8, 
+        'random_state':828, 
+        'min_child_weight':0.5, 
+        'eval_metric':'auc', 
+        'colsample_bytree':0.5
+        }
+nfolds = 4
+num_rounds = 400
+
+# 1.1 First optimize depth of trees and minium child weight.
+max_depth_grid = [3,5,8,10]
+min_child_weight_grid = [0.3,0.5,0.8,1.0]
+param_grid = list(product(max_depth_grid, min_child_weight_grid))
+for k in param_grid:
+    param_list['max_depth'] = k[0]
+    param_list['min_child_weight'] = k[1]
+    cv_result = xgb.cv(param_list, dtrain, num_boost_round=num_rounds, 
+                       nfold=nfolds, metrics=['auc'], early_stopping_rounds=10, seed=828, verbose_eval=400)
+    print ('Max_depth:{} Min_child_weight:{} AUC:{}'.format(k[0], k[1], cv_result['test-auc-mean'].iloc[-1]))
+
+#Max_depth:3 Min_child_weight:0.8 AUC:0.7515210000000001
+#Max_depth:5 Min_child_weight:0.5 AUC:0.75605375
+param_list['max_depth'] = 3
+param_list['min_child_weight'] = 0.8
+
+# 1.2 Second optimize subsample size for each iteration proportion of features used to build a tree.
+subsample_grid = [0.6,0.8,1.0]
+colsample_bytree_grid = [0.3,0.5,0.8,1.0]
+param_grid = list(product(subsample_grid, colsample_bytree_grid))
+for k in param_grid:
+    param_list['subsample'] = k[0]
+    param_list['colsample_bytree'] = k[1]
+    cv_result = xgb.cv(param_list, dtrain, num_boost_round=num_rounds, 
+                       nfold=nfolds, metrics=['auc'], early_stopping_rounds=10, seed=828, verbose_eval=400)
+    print ('Subsample:{} Colsample_bytree:{} AUC:{}'.format(k[0], k[1], cv_result['test-auc-mean'].iloc[-1]))
+
+#Subsample:0.8 Colsample_bytree:0.3 AUC:0.7515365
+param_list['subsample']=0.8
+param_list['colsample_bytree']=0.3
+
+
+# 1.3 Lastly optimize learning rate and number of trees.
+eta_grid = [0.1,0.05,0.01]
+num_rounds_grid = [250,500,1000]
+param_grid = list(product(eta_grid, num_rounds_grid))
+for k in param_grid:
+    param_list['eta']=k[0]
+    cv_result = xgb.cv(param_list, dtrain, num_boost_round=k[1], 
+                       nfold=nfolds, metrics=['auc'], early_stopping_rounds=10, seed=828, verbose_eval=k[1])
+    print ('Learning Rate:{} Num of trees:{} AUC:{}'.format(k[0], k[1], cv_result['test-auc-mean'].iloc[-1]))
+
+#Learning Rate:0.05 Num of trees:1000 AUC:0.751677
+param_list['eta'] = 0.05
+num_rounds = 1000
+cv_result = xgb.cv(param_list, dtrain, num_boost_round=1000, 
+                       nfold=nfolds, metrics=['auc'], early_stopping_rounds=10, seed=828)
+
+# Check the training and testing curve for each optimization.
+fig, ax1 = plt.subplots(figsize=(12,9))
+ax1.plot(np.arange(cv_result.shape[0])+1, cv_result['train-auc-mean'], 'b-', label='Train-AUC-Mean')
+ax1.set_xlabel('Boosting Iteration')
+ax1.set_ylabel('Training AUC', color='blue')
+
+ax2 = ax1.twinx()
+#ax2 = ax1
+ax2.plot(np.arange(cv_result.shape[0])+1, cv_result['test-auc-mean'], 'r-', label='Test-AUC-Mean')
+ax2.set_ylabel('Testing AUC', color='red')
+
+fig.legend(loc='upper right')
+fig.tight_layout()
+plt.show()
+
+evals_result = dict()
+watchlist = [(dtrain, 'dtrain')]
+rgr = xgb.train(param_list, dtrain, num_boost_round=503, evals=watchlist, early_stopping_rounds=10
+                ,evals_result=evals_result)
+
+
+
+
+# Re-fit model with tuned hyper-parameters
+param_list = {'max_depth':10, 'eta':0.1, 'objective':'binary:logistic','subsample':0.8, 'random_state':828, 'min_child_weight':0.5, 'eval_metric':'auc'}
+watchlist = [(dtrain, 'dtrain'), (dvalid, 'dvalid')]
+evals_result = []
+num_rounds = 62
+evals_result = dict()
+rgr = xgb.train(param_list, dtrain, num_boost_round=num_rounds, evals=watchlist,evals_result=evals_result)
+rgr.save_model(out_path+'XGBM.model')
+
+# Make Prediction of Test Data.
+prediction = pd.DataFrame(data={'SK_ID_CURR':test_set['SK_ID_CURR'], 'TARGET':rgr.predict(dtest)})
+prediction.to_csv(out_path+'XGBM_CV_2.csv',  index=False)
